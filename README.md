@@ -371,7 +371,7 @@ Generally, no. The K-factors compensate for predictable atmospheric physics. How
 
 ### Related Projects
 
-- [Connecting CloudWatcher to Astroshell Dome](https://indilib.org/)
+- [Connecting CloudWatcher to Astroshell Dome](https://github.com/joergs-git/astroshell/)
 
 ---
 
