@@ -6,7 +6,10 @@ An interactive tool for optimizing sky temperature correction parameters for the
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 
-<img width="600" height="504" alt="Bildschirmfoto 2026-01-28 um 10 30 28" src="https://github.com/user-attachments/assets/eae60ab0-8f55-48e2-964c-a33b0c68d463" />
+Over the years I was never really satisfied with my cloudwatcher calibration settings. This little optimizer changed that luckily!
+
+<img width="1521" height="1276" alt="Bildschirmfoto 2026-01-28 um 10 30 28" src="https://github.com/user-attachments/assets/c69a7d38-5412-4377-89a8-58a2782f3588" />
+
 
 <img width="849" height="529" alt="Bildschirmfoto 2026-01-28 um 10 28 48" src="https://github.com/user-attachments/assets/f5113fc3-9095-4ae8-a271-5ac9b120ab5f" />
 
