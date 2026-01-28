@@ -1,0 +1,891 @@
+#!/usr/bin/env python3
+"""
+AAG CloudWatcher Solo - Interactive K-Factor Optimizer
+=======================================================
+
+A user-friendly tool for optimizing sky temperature correction parameters
+for any location and climate profile.
+
+Requirements:
+    pip install numpy scipy matplotlib
+
+Usage:
+    python cloudwatcher_optimizer_interactive.py
+
+Author: joergsflow 2026 - Created for astronomical weather monitoring optimization
+License: MIT
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider, Button, TextBox
+from scipy.optimize import differential_evolution
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
+import os
+from pathlib import Path
+
+# ============================================================================
+# CORE MODEL
+# ============================================================================
+
+@dataclass
+class KFactors:
+    """K-factor parameters for the CloudWatcher correction model"""
+    K1: float = 33.0
+    K2: float = 0.0
+    K3: float = 0.0
+    K4: float = 100.0
+    K5: float = 100.0
+    K6: float = 0.0
+    K7: float = 0.0
+    
+    def to_array(self) -> np.ndarray:
+        return np.array([self.K1, self.K2, self.K3, self.K4, self.K5, self.K6, self.K7])
+    
+    @classmethod
+    def from_array(cls, arr: np.ndarray) -> 'KFactors':
+        return cls(K1=arr[0], K2=arr[1], K3=arr[2], K4=arr[3], 
+                   K5=arr[4], K6=arr[5], K7=arr[6])
+    
+    def __str__(self):
+        return f"K1={self.K1:.0f}, K2={self.K2:.0f}, K3={self.K3:.0f}, K4={self.K4:.0f}, K5={self.K5:.0f}, K6={self.K6:.0f}, K7={self.K7:.0f}"
+    
+    def to_dict(self):
+        return {'K1': self.K1, 'K2': self.K2, 'K3': self.K3, 
+                'K4': self.K4, 'K5': self.K5, 'K6': self.K6, 'K7': self.K7}
+
+
+@dataclass
+class ClimateProfile:
+    """Climate profile for a location"""
+    name: str = "Custom Location"
+    temp_min: float = -5.0      # Minimum expected temperature (°C)
+    temp_max: float = 25.0      # Maximum expected temperature (°C)
+    temp_typical: float = 10.0  # Typical/average temperature (°C)
+    humidity_factor: float = 1.0  # Relative humidity adjustment (0.8=dry, 1.2=humid)
+
+
+# Preset climate profiles
+CLIMATE_PRESETS = {
+    'north_germany': ClimateProfile("North Germany", -10, 30, 10, 1.0),
+    'south_germany': ClimateProfile("South Germany (Alpine)", -15, 28, 8, 0.95),
+    'mediterranean': ClimateProfile("Mediterranean", 0, 35, 18, 0.9),
+    'scandinavia': ClimateProfile("Scandinavia", -25, 25, 5, 0.85),
+    'uk_ireland': ClimateProfile("UK / Ireland", -5, 28, 12, 1.1),
+    'continental_us': ClimateProfile("Continental US (Midwest)", -20, 35, 12, 0.95),
+    'southwest_us': ClimateProfile("Southwest US (Desert)", -5, 42, 20, 0.7),
+    'australia': ClimateProfile("Australia (Temperate)", 0, 40, 18, 0.85),
+    'custom': ClimateProfile("Custom", -10, 30, 10, 1.0),
+}
+
+
+def calculate_T67(Ta: float, K2: float, K6: float, K7: float) -> float:
+    """
+    Calculate the cold weather factor T67
+    
+    Formula from Lunatico documentation:
+    If Abs((K2/10 - Ta)) < 1 Then
+        T67 = Sgn(K6) * Sgn(Ta - K2/10) * Abs((K2/10 - Ta))
+    Else
+        T67 = K6/10 * Sgn(Ta - K2/10) * (Log10(Abs((K2/10 - Ta))) + K7/100)
+    """
+    if K6 == 0:
+        return 0.0
+    
+    K2_scaled = K2 / 10.0
+    diff = K2_scaled - Ta
+    
+    if abs(diff) < 1:
+        sgn_K6 = np.sign(K6)
+        sgn_diff = np.sign(Ta - K2_scaled) if Ta != K2_scaled else 0
+        T67 = sgn_K6 * sgn_diff * abs(diff)
+    else:
+        sgn_diff = np.sign(Ta - K2_scaled)
+        log_term = np.log10(abs(diff)) + K7 / 100.0
+        T67 = (K6 / 10.0) * sgn_diff * log_term
+    
+    return T67
+
+
+def calculate_Td(Ta: float, kf: KFactors) -> float:
+    """
+    Calculate the temperature correction value Td
+    
+    Td = (K1/100) * (Ta - K2/10) + (K3/100) * exp(K4/1000 * Ta)^(K5/100) + T67
+    """
+    linear = (kf.K1 / 100.0) * (Ta - kf.K2 / 10.0)
+    exp_term = (kf.K3 / 100.0) * (np.exp(kf.K4 / 1000.0 * Ta) ** (kf.K5 / 100.0))
+    T67 = calculate_T67(Ta, kf.K2, kf.K6, kf.K7)
+    return linear + exp_term + T67
+
+
+def get_ir_temperature(Ta: float, sky_condition: str = 'clear', 
+                       humidity_factor: float = 1.0) -> float:
+    """
+    Estimate IR sensor temperature for given ambient temperature and sky condition.
+    
+    Args:
+        Ta: Ambient temperature (°C)
+        sky_condition: 'clear', 'thin_clouds', 'cloudy', 'overcast'
+        humidity_factor: Adjustment for local humidity (0.7=very dry, 1.3=very humid)
+    
+    Returns:
+        Estimated IR sensor reading Ts (°C)
+    """
+    if sky_condition == 'clear':
+        # Clear sky - sensor sees cold stratosphere
+        # Base delta decreases with humidity (more atmospheric IR emission)
+        base_delta = 25.0 * (2.0 - humidity_factor)  # Adjust for humidity
+        humidity_effect = 0.15 * humidity_factor
+        
+        delta = base_delta + humidity_effect * Ta
+        
+        # Non-linear effect at high temperatures (more water vapor)
+        if Ta > 15:
+            delta += 0.08 * humidity_factor * (Ta - 15) ** 1.5
+        
+        Ts = Ta - delta
+        
+    elif sky_condition == 'thin_clouds':
+        Ts = Ta - 15.0 - 0.05 * Ta
+        
+    elif sky_condition == 'cloudy':
+        Ts = Ta - 8.0 - 0.03 * Ta
+        
+    elif sky_condition == 'overcast':
+        Ts = Ta - 3.0
+        
+    else:
+        Ts = Ta - 25.0
+    
+    return Ts
+
+
+def calculate_Tsky(Ta: float, kf: KFactors, sky_condition: str = 'clear',
+                   humidity_factor: float = 1.0) -> float:
+    """Calculate corrected sky temperature: Tsky = Ts - Td"""
+    Ts = get_ir_temperature(Ta, sky_condition, humidity_factor)
+    Td = calculate_Td(Ta, kf)
+    return Ts - Td
+
+
+# ============================================================================
+# OPTIMIZATION
+# ============================================================================
+
+def objective_function(params: np.ndarray, Ta_range: np.ndarray, 
+                       humidity_factor: float = 1.0,
+                       target_tsky: float = -18.0) -> float:
+    """
+    Optimization objective: minimize variance of clear sky Tsky values
+    while maintaining proper threshold separation.
+    """
+    kf = KFactors.from_array(params)
+    
+    try:
+        # Clear sky temperatures
+        clear_temps = [calculate_Tsky(Ta, kf, 'clear', humidity_factor) 
+                       for Ta in Ta_range]
+        
+        if any(np.isnan(clear_temps)) or any(np.isinf(clear_temps)):
+            return 1e10
+        
+        # Cloudy temperatures (for validation)
+        cloudy_temps = [calculate_Tsky(Ta, kf, 'cloudy', humidity_factor) 
+                        for Ta in Ta_range]
+        
+        # Primary: minimize variance
+        variance = np.var(clear_temps)
+        
+        # Secondary: target mean around -18°C (well below -13°C threshold)
+        mean_clear = np.mean(clear_temps)
+        mean_penalty = (mean_clear - target_tsky) ** 2
+        
+        # Penalty: clear sky values should stay below -13°C
+        threshold_violations = sum(1 for t in clear_temps if t > -13.0)
+        threshold_penalty = threshold_violations * 100
+        
+        # Ensure clouds are still detectable (should be above -11°C mostly)
+        cloudy_mean = np.mean(cloudy_temps)
+        if cloudy_mean < -11:
+            separation_penalty = (-11 - cloudy_mean) ** 2 * 10
+        else:
+            separation_penalty = 0
+        
+        total_cost = (
+            variance * 10 +
+            mean_penalty * 0.5 +
+            threshold_penalty +
+            separation_penalty
+        )
+        
+        return total_cost
+        
+    except Exception:
+        return 1e10
+
+
+def optimize_k_factors(climate: ClimateProfile, 
+                       current_kf: Optional[KFactors] = None,
+                       progress_callback=None) -> Tuple[KFactors, dict]:
+    """
+    Find optimal K-factors for given climate profile.
+    
+    Returns:
+        Tuple of (optimized KFactors, statistics dict)
+    """
+    Ta_range = np.linspace(climate.temp_min, climate.temp_max, 200)
+    
+    bounds = [
+        (30, 80),     # K1
+        (-100, 150),  # K2
+        (0, 30),      # K3
+        (50, 200),    # K4
+        (80, 150),    # K5
+        (-25, 25),    # K6
+        (-30, 30),    # K7
+    ]
+    
+    result = differential_evolution(
+        objective_function,
+        bounds,
+        args=(Ta_range, climate.humidity_factor),
+        seed=42,
+        maxiter=2000,
+        tol=1e-10,
+        polish=True,
+        workers=1,  # Single thread for GUI compatibility
+        updating='deferred',
+        popsize=15,
+        callback=progress_callback
+    )
+    
+    optimized = KFactors(
+        K1=round(result.x[0]),
+        K2=round(result.x[1]),
+        K3=round(result.x[2]),
+        K4=round(result.x[3]),
+        K5=round(result.x[4]),
+        K6=round(result.x[5]),
+        K7=round(result.x[6])
+    )
+    
+    # Calculate statistics
+    clear_temps = [calculate_Tsky(Ta, optimized, 'clear', climate.humidity_factor) 
+                   for Ta in Ta_range]
+    
+    stats = {
+        'mean': np.mean(clear_temps),
+        'std': np.std(clear_temps),
+        'range': max(clear_temps) - min(clear_temps),
+        'min': min(clear_temps),
+        'max': max(clear_temps),
+        'success': result.success,
+        'iterations': result.nit
+    }
+    
+    return optimized, stats
+
+
+# ============================================================================
+# VISUALIZATION
+# ============================================================================
+
+def create_analysis_plots(climate: ClimateProfile, 
+                          configs: List[Tuple[str, KFactors]],
+                          save_path: Optional[str] = None) -> plt.Figure:
+    """Create comprehensive analysis plots."""
+    
+    Ta_range = np.linspace(climate.temp_min, climate.temp_max, 200)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f'CloudWatcher K-Factor Analysis - {climate.name}\n'
+                 f'Temperature Range: {climate.temp_min}°C to {climate.temp_max}°C',
+                 fontsize=14, fontweight='bold')
+    
+    colors = {'Current': '#e74c3c', 'Default': '#95a5a6', 
+              'Lunatico': '#3498db', 'OPTIMIZED': '#27ae60'}
+    
+    # Plot 1: Clear sky comparison
+    ax1 = axes[0, 0]
+    for name, kf in configs:
+        temps = [calculate_Tsky(Ta, kf, 'clear', climate.humidity_factor) 
+                 for Ta in Ta_range]
+        std = np.std(temps)
+        color = colors.get(name, 'purple')
+        lw = 2.5 if 'OPT' in name.upper() else 1.5
+        ax1.plot(Ta_range, temps, color=color, linewidth=lw,
+                 label=f"{name} (σ={std:.2f}°C)")
+    
+    ax1.axhline(y=-13, color='green', linestyle='--', linewidth=2, alpha=0.8)
+    ax1.axhline(y=-11, color='orange', linestyle='--', linewidth=2, alpha=0.8)
+    ax1.axhspan(-50, -13, alpha=0.1, color='green')
+    ax1.axhspan(-13, -11, alpha=0.1, color='yellow')
+    ax1.axhspan(-11, 10, alpha=0.1, color='red')
+    
+    ax1.set_xlabel('Ambient Temperature Ta (°C)')
+    ax1.set_ylabel('Corrected Sky Temperature Tsky (°C)')
+    ax1.set_title('★ Clear Sky - Should Be Horizontal! ★', fontweight='bold')
+    ax1.legend(loc='lower left')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(climate.temp_min - 1, climate.temp_max + 1)
+    ax1.set_ylim(-30, -5)
+    
+    # Plot 2: All sky conditions (optimized only)
+    ax2 = axes[0, 1]
+    opt_kf = [kf for name, kf in configs if 'OPT' in name.upper()]
+    if opt_kf:
+        kf = opt_kf[0]
+        conditions = [
+            ('Clear', 'clear', 'blue'),
+            ('Thin Clouds', 'thin_clouds', 'cyan'),
+            ('Cloudy', 'cloudy', 'orange'),
+            ('Overcast', 'overcast', 'red')
+        ]
+        for label, cond, col in conditions:
+            temps = [calculate_Tsky(Ta, kf, cond, climate.humidity_factor) 
+                     for Ta in Ta_range]
+            ax2.plot(Ta_range, temps, color=col, linewidth=2, label=label)
+    
+    ax2.axhline(y=-13, color='green', linestyle='--', linewidth=2, alpha=0.8)
+    ax2.axhline(y=-11, color='orange', linestyle='--', linewidth=2, alpha=0.8)
+    ax2.set_xlabel('Ambient Temperature Ta (°C)')
+    ax2.set_ylabel('Corrected Sky Temperature Tsky (°C)')
+    ax2.set_title('All Sky Conditions (Optimized K-Factors)', fontweight='bold')
+    ax2.legend(loc='lower left')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlim(climate.temp_min - 1, climate.temp_max + 1)
+    ax2.set_ylim(-30, 10)
+    
+    # Plot 3: Correction value Td
+    ax3 = axes[1, 0]
+    for name, kf in configs:
+        Td_vals = [calculate_Td(Ta, kf) for Ta in Ta_range]
+        color = colors.get(name, 'purple')
+        lw = 2.5 if 'OPT' in name.upper() else 1.5
+        ax3.plot(Ta_range, Td_vals, color=color, linewidth=lw, label=name)
+    
+    ax3.plot(Ta_range, Ta_range, 'k--', alpha=0.5, linewidth=1, label='Ta (reference)')
+    ax3.set_xlabel('Ambient Temperature Ta (°C)')
+    ax3.set_ylabel('Correction Value Td (°C)')
+    ax3.set_title('Correction Factor Comparison', fontweight='bold')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Bar chart comparison
+    ax4 = axes[1, 1]
+    names = [name for name, _ in configs]
+    ranges = []
+    stds = []
+    
+    for name, kf in configs:
+        temps = [calculate_Tsky(Ta, kf, 'clear', climate.humidity_factor) 
+                 for Ta in Ta_range]
+        ranges.append(max(temps) - min(temps))
+        stds.append(np.std(temps))
+    
+    x = np.arange(len(names))
+    width = 0.35
+    
+    bar_colors = [colors.get(n, 'gray') for n in names]
+    bars1 = ax4.bar(x - width/2, ranges, width, label='Range (°C)', 
+                    color=bar_colors, alpha=0.7)
+    bars2 = ax4.bar(x + width/2, stds, width, label='Std Dev (°C)',
+                    color=bar_colors, alpha=1.0, hatch='//')
+    
+    ax4.set_ylabel('Temperature Variation (°C)')
+    ax4.set_title('Comparison: Lower = Better', fontweight='bold')
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(names)
+    ax4.legend()
+    ax4.grid(True, alpha=0.3, axis='y')
+    
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            h = bar.get_height()
+            ax4.annotate(f'{h:.1f}', xy=(bar.get_x() + bar.get_width()/2, h),
+                         xytext=(0, 3), textcoords="offset points",
+                         ha='center', fontsize=9)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+        print(f"Plot saved to: {save_path}")
+    
+    return fig
+
+
+def print_results_table(climate: ClimateProfile, 
+                        configs: List[Tuple[str, KFactors]]) -> str:
+    """Generate formatted results table as string."""
+    
+    Ta_samples = np.linspace(climate.temp_min, climate.temp_max, 7)
+    
+    output = []
+    output.append("=" * 100)
+    output.append(f"ANALYSIS RESULTS - {climate.name}")
+    output.append(f"Temperature Range: {climate.temp_min}°C to {climate.temp_max}°C")
+    output.append("=" * 100)
+    
+    for name, kf in configs:
+        output.append(f"\n{'─' * 100}")
+        output.append(f"CONFIGURATION: {name}")
+        output.append(f"Parameters: {kf}")
+        output.append(f"{'─' * 100}")
+        output.append(f"\n{'Ta':>8} │ {'Ts(clear)':>10} {'Td':>10} {'Tsky':>10} │ {'Status'}")
+        output.append(f"{'─' * 8}─┼─{'─' * 32}─┼─{'─' * 12}")
+        
+        tsky_values = []
+        for Ta in Ta_samples:
+            Ts = get_ir_temperature(Ta, 'clear', climate.humidity_factor)
+            Td = calculate_Td(Ta, kf)
+            Tsky = Ts - Td
+            tsky_values.append(Tsky)
+            
+            if Tsky < -13:
+                status = "✓ CLEAR"
+            elif Tsky < -11:
+                status = "~ Cloudy"
+            else:
+                status = "✗ Overcast"
+            
+            output.append(f"{Ta:>8.1f} │ {Ts:>10.2f} {Td:>10.2f} {Tsky:>10.2f} │ {status}")
+        
+        output.append(f"\nStatistics (clear sky):")
+        output.append(f"  Mean:  {np.mean(tsky_values):.2f}°C")
+        output.append(f"  Std:   {np.std(tsky_values):.2f}°C")
+        output.append(f"  Range: {max(tsky_values) - min(tsky_values):.2f}°C")
+    
+    return "\n".join(output)
+
+
+# ============================================================================
+# INTERACTIVE GUI
+# ============================================================================
+
+class CloudWatcherOptimizer:
+    """Interactive GUI for CloudWatcher K-Factor optimization."""
+    
+    # Lunatico recommended K-factors for reference
+    LUNATICO_KF = KFactors(K1=33, K2=0, K3=8, K4=100, K5=100, K6=0, K7=0)
+    
+    def __init__(self):
+        self.climate = ClimateProfile("Custom", -10, 30, 10, 1.0)
+        self.current_kf = KFactors(K1=33, K2=0, K3=0, K4=100, K5=100, K6=0, K7=0)
+        self.optimized_kf = None
+        self.fig = None
+        self.axes = None
+        
+    def run_interactive(self):
+        """Launch interactive GUI."""
+        
+        # Create figure with subplots and control area
+        self.fig = plt.figure(figsize=(16, 13))
+        self.fig.suptitle('AAG CloudWatcher Solo - K-Factor Optimizer', 
+                          fontsize=16, fontweight='bold')
+        
+        # Main plot area - reduced bottom margin to bring controls closer
+        gs = self.fig.add_gridspec(2, 2, height_ratios=[1, 1], 
+                                   hspace=0.25, wspace=0.25,
+                                   bottom=0.32, top=0.92)
+        
+        self.ax_clear = self.fig.add_subplot(gs[0, 0])
+        self.ax_conditions = self.fig.add_subplot(gs[0, 1])
+        self.ax_correction = self.fig.add_subplot(gs[1, 0])
+        self.ax_comparison = self.fig.add_subplot(gs[1, 1])
+        
+        # Add sliders - Climate settings on the left
+        slider_color = 'lightgoldenrodyellow'
+        
+        ax_tmin = plt.axes([0.08, 0.24, 0.35, 0.018], facecolor=slider_color)
+        ax_tmax = plt.axes([0.08, 0.215, 0.35, 0.018], facecolor=slider_color)
+        ax_humidity = plt.axes([0.08, 0.19, 0.35, 0.018], facecolor=slider_color)
+        
+        self.slider_tmin = Slider(ax_tmin, 'Min Temp (°C)', -30, 10, 
+                                   valinit=self.climate.temp_min, valstep=1)
+        self.slider_tmax = Slider(ax_tmax, 'Max Temp (°C)', 15, 45, 
+                                   valinit=self.climate.temp_max, valstep=1)
+        self.slider_humidity = Slider(ax_humidity, 'Humidity Factor', 0.7, 1.3, 
+                                       valinit=self.climate.humidity_factor, valstep=0.05)
+        
+        # Current K-factor display/input - stacked vertically
+        k_slider_x = 0.55
+        k_slider_width = 0.35
+        k_slider_height = 0.016
+        k_slider_spacing = 0.022
+        k_slider_top = 0.24
+        
+        ax_k1 = plt.axes([k_slider_x, k_slider_top - 0*k_slider_spacing, k_slider_width, k_slider_height], facecolor=slider_color)
+        ax_k2 = plt.axes([k_slider_x, k_slider_top - 1*k_slider_spacing, k_slider_width, k_slider_height], facecolor=slider_color)
+        ax_k3 = plt.axes([k_slider_x, k_slider_top - 2*k_slider_spacing, k_slider_width, k_slider_height], facecolor=slider_color)
+        ax_k4 = plt.axes([k_slider_x, k_slider_top - 3*k_slider_spacing, k_slider_width, k_slider_height], facecolor=slider_color)
+        ax_k5 = plt.axes([k_slider_x, k_slider_top - 4*k_slider_spacing, k_slider_width, k_slider_height], facecolor=slider_color)
+        ax_k6 = plt.axes([k_slider_x, k_slider_top - 5*k_slider_spacing, k_slider_width, k_slider_height], facecolor=slider_color)
+        ax_k7 = plt.axes([k_slider_x, k_slider_top - 6*k_slider_spacing, k_slider_width, k_slider_height], facecolor=slider_color)
+        
+        self.slider_k1 = Slider(ax_k1, 'K1', 0, 100, valinit=self.current_kf.K1, valstep=1)
+        self.slider_k2 = Slider(ax_k2, 'K2', -100, 150, valinit=self.current_kf.K2, valstep=1)
+        self.slider_k3 = Slider(ax_k3, 'K3', 0, 50, valinit=self.current_kf.K3, valstep=1)
+        self.slider_k4 = Slider(ax_k4, 'K4', 50, 200, valinit=self.current_kf.K4, valstep=1)
+        self.slider_k5 = Slider(ax_k5, 'K5', 50, 200, valinit=self.current_kf.K5, valstep=1)
+        self.slider_k6 = Slider(ax_k6, 'K6', -30, 30, valinit=self.current_kf.K6, valstep=1)
+        self.slider_k7 = Slider(ax_k7, 'K7', -30, 30, valinit=self.current_kf.K7, valstep=1)
+        
+        # Buttons - below climate sliders
+        ax_optimize = plt.axes([0.08, 0.13, 0.12, 0.04])
+        ax_reset = plt.axes([0.21, 0.13, 0.08, 0.04])
+        ax_save = plt.axes([0.30, 0.13, 0.10, 0.04])
+        
+        self.btn_optimize = Button(ax_optimize, 'OPTIMIZE', color='lightgreen')
+        self.btn_reset = Button(ax_reset, 'Reset', color='lightyellow')
+        self.btn_save = Button(ax_save, 'Save Plot', color='lightblue')
+        
+        # Results display - prominent box below K-factor sliders
+        self.results_box = self.fig.add_axes([0.55, 0.02, 0.40, 0.08])
+        self.results_box.set_facecolor('#e8f5e9')  # Light green background
+        self.results_box.set_xticks([])
+        self.results_box.set_yticks([])
+        for spine in self.results_box.spines.values():
+            spine.set_edgecolor('#27ae60')
+            spine.set_linewidth(2)
+        self.results_box.set_title('OPTIMIZED K-FACTORS', fontsize=10, fontweight='bold', 
+                                   color='#27ae60', loc='left', pad=2)
+        
+        self.results_text = self.results_box.text(0.02, 0.5, 'Click OPTIMIZE to calculate...', 
+                                                   fontsize=10, family='monospace',
+                                                   verticalalignment='center',
+                                                   transform=self.results_box.transAxes)
+        
+        # Connect callbacks
+        self.slider_tmin.on_changed(self.update_climate)
+        self.slider_tmax.on_changed(self.update_climate)
+        self.slider_humidity.on_changed(self.update_climate)
+        
+        for slider in [self.slider_k1, self.slider_k2, self.slider_k3,
+                       self.slider_k4, self.slider_k5, self.slider_k6, self.slider_k7]:
+            slider.on_changed(self.update_kfactors)
+        
+        self.btn_optimize.on_clicked(self.run_optimization)
+        self.btn_reset.on_clicked(self.reset_to_defaults)
+        self.btn_save.on_clicked(self.save_plot)
+        
+        # Initial plot
+        self.update_plots()
+        
+        plt.show()
+    
+    def update_climate(self, val):
+        """Update climate profile from sliders."""
+        self.climate.temp_min = self.slider_tmin.val
+        self.climate.temp_max = self.slider_tmax.val
+        self.climate.humidity_factor = self.slider_humidity.val
+        self.update_plots()
+    
+    def update_kfactors(self, val):
+        """Update current K-factors from sliders."""
+        self.current_kf = KFactors(
+            K1=self.slider_k1.val,
+            K2=self.slider_k2.val,
+            K3=self.slider_k3.val,
+            K4=self.slider_k4.val,
+            K5=self.slider_k5.val,
+            K6=self.slider_k6.val,
+            K7=self.slider_k7.val
+        )
+        self.update_plots()
+    
+    def update_plots(self):
+        """Refresh all plots with current settings."""
+        Ta_range = np.linspace(self.climate.temp_min, self.climate.temp_max, 200)
+        
+        # Clear all axes
+        for ax in [self.ax_clear, self.ax_conditions, self.ax_correction, self.ax_comparison]:
+            ax.clear()
+        
+        # Prepare configurations - always include Lunatico reference
+        configs = [('Current', self.current_kf)]
+        if self.optimized_kf:
+            configs.append(('OPTIMIZED', self.optimized_kf))
+        
+        colors = {'Current': '#e74c3c', 'OPTIMIZED': '#27ae60', 'Lunatico': '#888888'}
+        
+        # Plot 1: Clear sky - add Lunatico reference first (in background)
+        lunatico_temps = [calculate_Tsky(Ta, self.LUNATICO_KF, 'clear', self.climate.humidity_factor) 
+                         for Ta in Ta_range]
+        lunatico_std = np.std(lunatico_temps)
+        self.ax_clear.plot(Ta_range, lunatico_temps, color='#888888', linewidth=1.5,
+                          linestyle='--', alpha=0.7, 
+                          label=f"Lunatico Ref (σ={lunatico_std:.2f}°C)")
+        
+        for name, kf in configs:
+            temps = [calculate_Tsky(Ta, kf, 'clear', self.climate.humidity_factor) 
+                     for Ta in Ta_range]
+            std = np.std(temps)
+            lw = 3 if name == 'OPTIMIZED' else 2
+            self.ax_clear.plot(Ta_range, temps, color=colors.get(name, 'gray'),
+                              linewidth=lw, label=f"{name} (σ={std:.2f}°C)")
+        
+        self.ax_clear.axhline(y=-13, color='green', linestyle='--', linewidth=2, alpha=0.8)
+        self.ax_clear.axhline(y=-11, color='orange', linestyle='--', linewidth=2, alpha=0.8)
+        self.ax_clear.axhspan(-50, -13, alpha=0.1, color='green')
+        self.ax_clear.axhspan(-13, -11, alpha=0.1, color='yellow')
+        self.ax_clear.axhspan(-11, 10, alpha=0.1, color='red')
+        self.ax_clear.set_xlabel('Ambient Temperature (°C)')
+        self.ax_clear.set_ylabel('Corrected Sky Temp (°C)')
+        self.ax_clear.set_title('Clear Sky - Should Be Horizontal!', fontweight='bold')
+        self.ax_clear.legend(loc='lower left', fontsize=9)
+        self.ax_clear.grid(True, alpha=0.3)
+        self.ax_clear.set_ylim(-30, -5)
+        
+        # Plot 2: All conditions
+        kf = self.optimized_kf if self.optimized_kf else self.current_kf
+        for label, cond, col in [('Clear', 'clear', 'blue'), ('Thin Clouds', 'thin_clouds', 'cyan'),
+                                  ('Cloudy', 'cloudy', 'orange'), ('Overcast', 'overcast', 'red')]:
+            temps = [calculate_Tsky(Ta, kf, cond, self.climate.humidity_factor) for Ta in Ta_range]
+            self.ax_conditions.plot(Ta_range, temps, color=col, linewidth=2, label=label)
+        
+        self.ax_conditions.axhline(y=-13, color='green', linestyle='--', linewidth=2, alpha=0.8)
+        self.ax_conditions.axhline(y=-11, color='orange', linestyle='--', linewidth=2, alpha=0.8)
+        self.ax_conditions.set_xlabel('Ambient Temperature (°C)')
+        self.ax_conditions.set_ylabel('Corrected Sky Temp (°C)')
+        title_suffix = " (Optimized)" if self.optimized_kf else " (Current)"
+        self.ax_conditions.set_title(f'All Sky Conditions{title_suffix}', fontweight='bold')
+        self.ax_conditions.legend(loc='lower left', fontsize=9)
+        self.ax_conditions.grid(True, alpha=0.3)
+        self.ax_conditions.set_ylim(-30, 10)
+        
+        # Plot 3: Correction values - add Lunatico reference
+        lunatico_Td = [calculate_Td(Ta, self.LUNATICO_KF) for Ta in Ta_range]
+        self.ax_correction.plot(Ta_range, lunatico_Td, color='#888888', linewidth=1.5,
+                               linestyle='--', alpha=0.7, label='Lunatico Ref')
+        
+        for name, kf in configs:
+            Td_vals = [calculate_Td(Ta, kf) for Ta in Ta_range]
+            lw = 3 if name == 'OPTIMIZED' else 2
+            self.ax_correction.plot(Ta_range, Td_vals, color=colors.get(name, 'gray'),
+                                    linewidth=lw, label=name)
+        self.ax_correction.plot(Ta_range, Ta_range, 'k:', alpha=0.3, label='Ta (ref)')
+        self.ax_correction.set_xlabel('Ambient Temperature (°C)')
+        self.ax_correction.set_ylabel('Correction Value Td (°C)')
+        self.ax_correction.set_title('Correction Factor', fontweight='bold')
+        self.ax_correction.legend(fontsize=9)
+        self.ax_correction.grid(True, alpha=0.3)
+        
+        # Plot 4: Comparison bars - include Lunatico
+        bar_configs = [('Lunatico', self.LUNATICO_KF)] + configs
+        names = [n for n, _ in bar_configs]
+        ranges = []
+        stds = []
+        for name, kf in bar_configs:
+            temps = [calculate_Tsky(Ta, kf, 'clear', self.climate.humidity_factor) 
+                     for Ta in Ta_range]
+            ranges.append(max(temps) - min(temps))
+            stds.append(np.std(temps))
+        
+        x = np.arange(len(names))
+        width = 0.35
+        bar_colors = [colors.get(n, '#888888') for n in names]
+        
+        bars1 = self.ax_comparison.bar(x - width/2, ranges, width, label='Range (°C)',
+                               color=bar_colors, alpha=0.7)
+        bars2 = self.ax_comparison.bar(x + width/2, stds, width, label='Std Dev (°C)',
+                               color=bar_colors, hatch='//', edgecolor='white')
+        
+        # Add value labels on bars
+        for bar in bars1:
+            h = bar.get_height()
+            self.ax_comparison.annotate(f'{h:.1f}', xy=(bar.get_x() + bar.get_width()/2, h),
+                                        xytext=(0, 2), textcoords="offset points",
+                                        ha='center', fontsize=8)
+        for bar in bars2:
+            h = bar.get_height()
+            self.ax_comparison.annotate(f'{h:.1f}', xy=(bar.get_x() + bar.get_width()/2, h),
+                                        xytext=(0, 2), textcoords="offset points",
+                                        ha='center', fontsize=8)
+        
+        self.ax_comparison.set_xticks(x)
+        self.ax_comparison.set_xticklabels(names, fontsize=10)
+        self.ax_comparison.set_ylabel('Temperature Variation (°C)')
+        self.ax_comparison.set_title('Comparison: Lower = Better', fontweight='bold')
+        self.ax_comparison.legend(fontsize=9)
+        self.ax_comparison.grid(True, alpha=0.3, axis='y')
+        
+        self.fig.canvas.draw_idle()
+    
+    def run_optimization(self, event):
+        """Run the optimization."""
+        self.btn_optimize.label.set_text('Optimizing...')
+        self.fig.canvas.draw_idle()
+        
+        try:
+            self.optimized_kf, stats = optimize_k_factors(self.climate, self.current_kf)
+            
+            # Update prominent results box
+            result_text = (
+                f"K1={self.optimized_kf.K1:.0f}  K2={self.optimized_kf.K2:.0f}  "
+                f"K3={self.optimized_kf.K3:.0f}  K4={self.optimized_kf.K4:.0f}  "
+                f"K5={self.optimized_kf.K5:.0f}  K6={self.optimized_kf.K6:.0f}  "
+                f"K7={self.optimized_kf.K7:.0f}\n"
+                f"Range: {stats['range']:.2f}°C → Std Dev: {stats['std']:.2f}°C  ✓"
+            )
+            self.results_text.set_text(result_text)
+            self.results_box.set_facecolor('#c8e6c9')  # Brighter green on success
+            
+            self.update_plots()
+            
+        except Exception as e:
+            self.results_text.set_text(f"Error: {str(e)}")
+            self.results_box.set_facecolor('#ffcdd2')  # Red on error
+        
+        self.btn_optimize.label.set_text('OPTIMIZE')
+        self.fig.canvas.draw_idle()
+    
+    def reset_to_defaults(self, event):
+        """Reset to default values."""
+        self.current_kf = KFactors()
+        self.optimized_kf = None
+        
+        self.slider_k1.set_val(33)
+        self.slider_k2.set_val(0)
+        self.slider_k3.set_val(0)
+        self.slider_k4.set_val(100)
+        self.slider_k5.set_val(100)
+        self.slider_k6.set_val(0)
+        self.slider_k7.set_val(0)
+        
+        self.results_text.set_text('Click OPTIMIZE to calculate...')
+        self.results_box.set_facecolor('#e8f5e9')
+        self.update_plots()
+    
+    def save_plot(self, event):
+        """Save current plot to file."""
+        # Use user's home directory
+        save_dir = Path.home() / "Desktop"
+        if not save_dir.exists():
+            save_dir = Path.home()
+        
+        filename = save_dir / "cloudwatcher_analysis.png"
+        self.fig.savefig(filename, dpi=150, bbox_inches='tight', facecolor='white')
+        self.results_text.set_text(f"Saved to: {filename}")
+        self.fig.canvas.draw_idle()
+
+
+# ============================================================================
+# COMMAND LINE INTERFACE
+# ============================================================================
+
+def run_cli():
+    """Command-line interface for non-interactive use."""
+    
+    print("=" * 70)
+    print("AAG CloudWatcher Solo - K-Factor Optimizer")
+    print("=" * 70)
+    
+    print("\nAvailable climate presets:")
+    for i, (key, profile) in enumerate(CLIMATE_PRESETS.items(), 1):
+        print(f"  {i}. {profile.name} ({profile.temp_min}°C to {profile.temp_max}°C)")
+    
+    print("\nEnter preset number or 'c' for custom: ", end="")
+    choice = input().strip()
+    
+    if choice.lower() == 'c':
+        print("\nCustom climate profile:")
+        temp_min = float(input("  Minimum temperature (°C): "))
+        temp_max = float(input("  Maximum temperature (°C): "))
+        humidity = float(input("  Humidity factor (0.7-1.3, default 1.0): ") or "1.0")
+        climate = ClimateProfile("Custom", temp_min, temp_max, 
+                                 (temp_min + temp_max) / 2, humidity)
+    else:
+        try:
+            idx = int(choice) - 1
+            climate = list(CLIMATE_PRESETS.values())[idx]
+        except (ValueError, IndexError):
+            print("Invalid choice, using North Germany default")
+            climate = CLIMATE_PRESETS['north_germany']
+    
+    print(f"\nUsing climate profile: {climate.name}")
+    print(f"Temperature range: {climate.temp_min}°C to {climate.temp_max}°C")
+    
+    # Get current K-factors
+    print("\nEnter your current K-factors (or press Enter for defaults):")
+    try:
+        k1 = float(input("  K1 [33]: ") or "33")
+        k2 = float(input("  K2 [0]: ") or "0")
+        k3 = float(input("  K3 [0]: ") or "0")
+        k4 = float(input("  K4 [100]: ") or "100")
+        k5 = float(input("  K5 [100]: ") or "100")
+        k6 = float(input("  K6 [0]: ") or "0")
+        k7 = float(input("  K7 [0]: ") or "0")
+        current_kf = KFactors(k1, k2, k3, k4, k5, k6, k7)
+    except ValueError:
+        current_kf = KFactors()
+    
+    print("\nOptimizing... (this may take 30-60 seconds)")
+    
+    optimized_kf, stats = optimize_k_factors(climate, current_kf)
+    
+    # Prepare configurations
+    default_kf = KFactors()
+    configs = [
+        ('Current', current_kf),
+        ('Default', default_kf),
+        ('OPTIMIZED', optimized_kf)
+    ]
+    
+    # Print results
+    print("\n" + print_results_table(climate, configs))
+    
+    print("\n" + "=" * 70)
+    print("RECOMMENDED K-FACTORS")
+    print("=" * 70)
+    print(f"""
+╔═══════════════════════════════════════════╗
+║  K1 = {optimized_kf.K1:<6.0f}                         ║
+║  K2 = {optimized_kf.K2:<6.0f}                         ║
+║  K3 = {optimized_kf.K3:<6.0f}                         ║
+║  K4 = {optimized_kf.K4:<6.0f}                         ║
+║  K5 = {optimized_kf.K5:<6.0f}                         ║
+║  K6 = {optimized_kf.K6:<6.0f}                         ║
+║  K7 = {optimized_kf.K7:<6.0f}                         ║
+╚═══════════════════════════════════════════╝
+
+Expected improvement:
+  Range: {stats['range']:.2f}°C (target: <3°C)
+  Std Dev: {stats['std']:.2f}°C (target: <1°C)
+""")
+    
+    # Save plot
+    save_choice = input("\nSave analysis plot? (y/n): ").strip().lower()
+    if save_choice == 'y':
+        save_path = Path.home() / "Desktop" / "cloudwatcher_analysis.png"
+        create_analysis_plots(climate, configs, str(save_path))
+        print(f"Plot saved to: {save_path}")
+    
+    # Show plot
+    show_choice = input("Show interactive plot? (y/n): ").strip().lower()
+    if show_choice == 'y':
+        create_analysis_plots(climate, configs)
+        plt.show()
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    """Main entry point."""
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == '--cli':
+        run_cli()
+    else:
+        print("Starting interactive GUI...")
+        print("(Use --cli flag for command-line mode)")
+        optimizer = CloudWatcherOptimizer()
+        optimizer.run_interactive()
+
+
+if __name__ == "__main__":
+    main()
