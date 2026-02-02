@@ -7,6 +7,7 @@ An interactive tool for optimizing sky temperature correction parameters for the
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 
 Over the years I was never really satisfied with my cloudwatcher calibration settings. This little optimizer changed that luckily!
+Just by entering 3 numbers (min/max temperature and climate region) it simulates the optimum by finishing around around 6 Million calculations - in a minute or so.
 
 <img width="1521" height="1276" alt="Bildschirmfoto 2026-01-28 um 10 30 28" src="https://github.com/user-attachments/assets/c69a7d38-5412-4377-89a8-58a2782f3588" />
 
