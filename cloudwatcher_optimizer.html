@@ -1,0 +1,1146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AAG CloudWatcher Solo - K-Factor Optimizer</title>
+
+<!--
+  ============================================================================
+  AAG CloudWatcher Solo - K-Factor Optimizer (Browser Version)
+  ============================================================================
+
+  This is a self-contained HTML/JavaScript port of the Python cloudwatcher_optimizer.
+  It runs entirely in the browser with no server required.
+
+  WHAT THIS TOOL DOES:
+  The AAG CloudWatcher measures infrared sky temperature to detect clouds.
+  But the raw readings drift with seasons -- clear skies read differently in
+  winter vs summer due to atmospheric water vapor changes. This tool finds
+  the best correction parameters (K1-K7) so that "clear sky" always reads
+  the same temperature, regardless of season.
+
+  HOW THE OPTIMIZATION WORKS (plain language):
+  Imagine you have 7 knobs (K1-K7) that control how the CloudWatcher
+  compensates for temperature. The goal is to turn these knobs so that
+  on a clear night, the corrected sky temperature reads about -18°C
+  whether it's a cold winter night (-10°C) or a warm summer night (+30°C).
+
+  The optimizer works like this:
+  1. It creates 105 random "guesses" for the 7 knobs (the "population")
+  2. Each guess is tested: "If I use these knob settings, how flat would
+     the clear-sky reading be across all temperatures?" -- this test
+     simulates 200 temperature points from your min to max temp
+  3. The guesses compete: bad ones are replaced by mixing good ones
+     together (like breeding the best candidates)
+  4. This repeats for ~255 generations until all guesses converge to
+     roughly the same (optimal) answer
+  5. A final fine-tuning step nudges each knob slightly to polish the result
+
+  TOTAL COMPUTATION (typical run):
+  - ~27,000 candidate K-factor combinations are tested
+  - Each test simulates 400 sky temperatures (200 clear + 200 cloudy)
+  - That's ~10.8 million individual sky temperature calculations
+  - Involving ~200 million floating-point arithmetic operations
+  - Modern browsers complete this in under 1 second thanks to JIT compilation
+
+  EXTERNAL DEPENDENCY:
+  - Plotly.js (loaded from CDN) for interactive charts
+
+  Author: joergsflow 2026 - Created for astronomical weather monitoring optimization
+  License: MIT
+  ============================================================================
+-->
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+
+<style>
+  /* ---- Base layout: dark theme suitable for astronomy use ---- */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    min-height: 100vh;
+  }
+  header {
+    background: linear-gradient(135deg, #16213e, #0f3460);
+    padding: 12px 24px;
+    text-align: center;
+    border-bottom: 2px solid #27ae60;
+  }
+  header h1 { font-size: 1.4em; color: #fff; letter-spacing: 1px; }
+  header p { font-size: 0.85em; color: #a0a0c0; margin-top: 2px; }
+
+  /* ---- Main app: controls on top, plots fill remaining space ---- */
+  .app { display: flex; flex-direction: column; height: calc(100vh - 70px); }
+
+  .controls {
+    display: flex;
+    gap: 16px;
+    padding: 12px 16px;
+    background: #16213e;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+  .panel {
+    background: #1a1a2e;
+    border: 1px solid #2a2a4e;
+    border-radius: 8px;
+    padding: 12px;
+    flex: 1;
+    min-width: 220px;
+  }
+  .panel h3 {
+    font-size: 0.85em;
+    color: #27ae60;
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  /* ---- Slider rows: label | slider track | current value ---- */
+  .slider-row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 5px;
+    gap: 8px;
+  }
+  .slider-row label {
+    font-size: 0.8em;
+    color: #a0a0c0;
+    min-width: 90px;
+    text-align: right;
+  }
+  .slider-row input[type="range"] {
+    flex: 1;
+    height: 6px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: #2a2a4e;
+    border-radius: 3px;
+    outline: none;
+  }
+  .slider-row input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: #27ae60;
+    cursor: pointer;
+  }
+  .slider-row input[type="range"]::-moz-range-thumb {
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: #27ae60;
+    cursor: pointer;
+    border: none;
+  }
+  .slider-row .val {
+    font-size: 0.8em;
+    color: #fff;
+    min-width: 40px;
+    text-align: right;
+    font-family: monospace;
+  }
+
+  /* ---- Climate preset dropdown ---- */
+  select {
+    width: 100%;
+    padding: 5px 8px;
+    background: #2a2a4e;
+    color: #e0e0e0;
+    border: 1px solid #3a3a5e;
+    border-radius: 4px;
+    font-size: 0.8em;
+    margin-bottom: 8px;
+  }
+
+  /* ---- Action buttons ---- */
+  .btn-row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  button {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 4px;
+    font-size: 0.85em;
+    font-weight: 600;
+    cursor: pointer;
+    transition: filter 0.15s;
+  }
+  button:hover { filter: brightness(1.15); }
+  button:active { filter: brightness(0.9); }
+  .btn-optimize { background: #27ae60; color: #fff; }
+  .btn-optimize:disabled { background: #555; cursor: wait; }
+  .btn-reset { background: #f39c12; color: #fff; }
+  .btn-save { background: #3498db; color: #fff; }
+
+  /* ---- Results display box (shows optimized K-factors) ---- */
+  .results-box {
+    background: #1b2e1b;
+    border: 2px solid #27ae60;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.82em;
+    min-height: 48px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  .results-box .title {
+    font-size: 0.75em;
+    font-weight: 700;
+    color: #27ae60;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+  }
+  .results-box.error { background: #2e1b1b; border-color: #e74c3c; }
+  .results-box.success { background: #1e3a1e; }
+
+  /* ---- Plot container fills all remaining vertical space ---- */
+  .plots {
+    flex: 1;
+    padding: 8px 16px 16px;
+    min-height: 0;
+  }
+  #plotDiv { width: 100%; height: 100%; min-height: 450px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AAG CloudWatcher Solo &mdash; K-Factor Optimizer</h1>
+  <p>Interactive sky temperature correction parameter optimization for astronomical observation</p>
+</header>
+
+<div class="app">
+  <div class="controls">
+
+    <!--
+      CLIMATE PANEL
+      The user selects their geographic region (or custom values).
+      Min/max temp defines the annual temperature range at their observatory.
+      Humidity factor adjusts for local atmospheric moisture content:
+        0.7 = very dry (desert)  |  1.0 = normal  |  1.3 = very humid (coastal)
+    -->
+    <div class="panel">
+      <h3>Climate Settings</h3>
+      <select id="presetSelect">
+        <option value="north_germany">North Germany (-10 to 30 °C)</option>
+        <option value="south_germany">South Germany / Alpine (-15 to 28 °C)</option>
+        <option value="mediterranean">Mediterranean (0 to 35 °C)</option>
+        <option value="scandinavia">Scandinavia (-25 to 25 °C)</option>
+        <option value="uk_ireland">UK / Ireland (-5 to 28 °C)</option>
+        <option value="continental_us">Continental US / Midwest (-20 to 35 °C)</option>
+        <option value="southwest_us">Southwest US / Desert (-5 to 42 °C)</option>
+        <option value="australia">Australia / Temperate (0 to 40 °C)</option>
+        <option value="custom">Custom</option>
+      </select>
+      <div class="slider-row">
+        <label>Min Temp (°C)</label>
+        <input type="range" id="slTmin" min="-30" max="10" value="-10" step="1">
+        <span class="val" id="valTmin">-10</span>
+      </div>
+      <div class="slider-row">
+        <label>Max Temp (°C)</label>
+        <input type="range" id="slTmax" min="15" max="45" value="30" step="1">
+        <span class="val" id="valTmax">30</span>
+      </div>
+      <div class="slider-row">
+        <label>Humidity</label>
+        <input type="range" id="slHumidity" min="0.7" max="1.3" value="1.0" step="0.05">
+        <span class="val" id="valHumidity">1.00</span>
+      </div>
+      <div class="btn-row">
+        <button class="btn-optimize" id="btnOptimize">OPTIMIZE</button>
+        <button class="btn-reset" id="btnReset">Reset</button>
+        <button class="btn-save" id="btnSave">Save Plot</button>
+      </div>
+    </div>
+
+    <!--
+      K-FACTOR PANEL
+      These 7 sliders represent the CloudWatcher's internal correction parameters.
+      Users can enter their current device settings here to see how they perform,
+      then click OPTIMIZE to find better values.
+      K1 = main correction strength (how much to compensate per degree)
+      K2 = temperature offset (pivot point for cold-weather adjustment)
+      K3 = exponential correction strength (for hot climates)
+      K4 = exponential growth rate
+      K5 = exponential power
+      K6 = cold weather correction magnitude
+      K7 = cold weather logarithmic fine-tuning
+    -->
+    <div class="panel">
+      <h3>K-Factor Parameters</h3>
+      <div class="slider-row">
+        <label>K1</label>
+        <input type="range" id="slK1" min="0" max="100" value="33" step="1">
+        <span class="val" id="valK1">33</span>
+      </div>
+      <div class="slider-row">
+        <label>K2</label>
+        <input type="range" id="slK2" min="-100" max="150" value="0" step="1">
+        <span class="val" id="valK2">0</span>
+      </div>
+      <div class="slider-row">
+        <label>K3</label>
+        <input type="range" id="slK3" min="0" max="50" value="0" step="1">
+        <span class="val" id="valK3">0</span>
+      </div>
+      <div class="slider-row">
+        <label>K4</label>
+        <input type="range" id="slK4" min="50" max="200" value="100" step="1">
+        <span class="val" id="valK4">100</span>
+      </div>
+      <div class="slider-row">
+        <label>K5</label>
+        <input type="range" id="slK5" min="50" max="200" value="100" step="1">
+        <span class="val" id="valK5">100</span>
+      </div>
+      <div class="slider-row">
+        <label>K6</label>
+        <input type="range" id="slK6" min="-30" max="30" value="0" step="1">
+        <span class="val" id="valK6">0</span>
+      </div>
+      <div class="slider-row">
+        <label>K7</label>
+        <input type="range" id="slK7" min="-30" max="30" value="0" step="1">
+        <span class="val" id="valK7">0</span>
+      </div>
+    </div>
+
+    <!-- RESULTS PANEL: shows the optimized K-factor values after optimization -->
+    <div class="panel" style="min-width: 280px;">
+      <h3>Results</h3>
+      <div class="results-box" id="resultsBox">
+        <div class="title">Optimized K-Factors</div>
+        <div id="resultsText">Click OPTIMIZE to calculate...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PLOT AREA: 2x2 grid of interactive charts rendered by Plotly.js -->
+  <div class="plots">
+    <div id="plotDiv"></div>
+  </div>
+</div>
+
+<script>
+// ============================================================================
+// CLIMATE PRESETS
+// ============================================================================
+// Each preset defines the expected annual temperature range and humidity
+// for a geographic region. The optimizer uses temp_min/temp_max to simulate
+// sky temperatures across the full range of conditions the user will encounter.
+// humidity_factor adjusts the IR sensor model:
+//   < 1.0 = dry air (less atmospheric IR emission, sensor sees colder sky)
+//   > 1.0 = humid air (more atmospheric IR emission, sensor sees warmer sky)
+const CLIMATE_PRESETS = {
+  north_germany:   { name: "North Germany",               temp_min: -10, temp_max: 30, humidity_factor: 1.0  },
+  south_germany:   { name: "South Germany (Alpine)",      temp_min: -15, temp_max: 28, humidity_factor: 0.95 },
+  mediterranean:   { name: "Mediterranean",               temp_min:   0, temp_max: 35, humidity_factor: 0.9  },
+  scandinavia:     { name: "Scandinavia",                 temp_min: -25, temp_max: 25, humidity_factor: 0.85 },
+  uk_ireland:      { name: "UK / Ireland",                temp_min:  -5, temp_max: 28, humidity_factor: 1.1  },
+  continental_us:  { name: "Continental US (Midwest)",     temp_min: -20, temp_max: 35, humidity_factor: 0.95 },
+  southwest_us:    { name: "Southwest US (Desert)",        temp_min:  -5, temp_max: 42, humidity_factor: 0.7  },
+  australia:       { name: "Australia (Temperate)",        temp_min:   0, temp_max: 40, humidity_factor: 0.85 },
+  custom:          { name: "Custom",                       temp_min: -10, temp_max: 30, humidity_factor: 1.0  },
+};
+
+// Lunatico's recommended K-factors (from their manual) -- used as a reference line in plots
+const LUNATICO_KF = { K1: 33, K2: 0, K3: 8, K4: 100, K5: 100, K6: 0, K7: 0 };
+
+// Factory defaults (no exponential correction)
+const DEFAULT_KF  = { K1: 33, K2: 0, K3: 0, K4: 100, K5: 100, K6: 0, K7: 0 };
+
+
+// ============================================================================
+// ARRAY HELPERS
+// ============================================================================
+// These replace NumPy functions from the Python version.
+// linspace: creates an evenly-spaced array of n values from start to stop.
+//   Example: linspace(-10, 30, 200) creates 200 points from -10°C to 30°C
+function linspace(start, stop, n) {
+  const arr = new Float64Array(n);
+  if (n === 1) { arr[0] = start; return arr; }
+  const step = (stop - start) / (n - 1);
+  for (let i = 0; i < n; i++) arr[i] = start + i * step;
+  return arr;
+}
+
+// Standard statistical functions operating on typed arrays
+function mean(arr) { let s = 0; for (let i = 0; i < arr.length; i++) s += arr[i]; return s / arr.length; }
+function variance(arr) { const m = mean(arr); let s = 0; for (let i = 0; i < arr.length; i++) s += (arr[i] - m) ** 2; return s / arr.length; }
+function stddev(arr) { return Math.sqrt(variance(arr)); }
+function arrMin(arr) { let m = Infinity; for (let i = 0; i < arr.length; i++) if (arr[i] < m) m = arr[i]; return m; }
+function arrMax(arr) { let m = -Infinity; for (let i = 0; i < arr.length; i++) if (arr[i] > m) m = arr[i]; return m; }
+
+
+// ============================================================================
+// PHYSICS ENGINE
+// ============================================================================
+// These functions implement the Lunatico CloudWatcher's sky temperature
+// correction model. They are pure math functions with no side effects --
+// given the same inputs, they always return the same outputs.
+//
+// The correction pipeline is:
+//   1. getIrTemperature(Ta) --> Ts   (simulate what the IR sensor reads)
+//   2. calculateTd(Ta, K-factors) --> Td   (compute the correction value)
+//   3. Tsky = Ts - Td   (apply correction to get final sky temperature)
+//
+// The GOAL of good K-factors is: Tsky should be approximately -18°C for
+// clear skies, regardless of whether Ta is -10°C (winter) or +30°C (summer).
+
+/**
+ * Calculate the cold-weather correction factor T67.
+ *
+ * This handles an additional adjustment near a specific temperature threshold
+ * (K2/10). Think of it as: "below this temperature, apply extra correction
+ * because the atmosphere behaves differently in very cold conditions."
+ *
+ * When K6 = 0, this factor is disabled (returns 0).
+ *
+ * Formula from Lunatico documentation:
+ *   If |K2/10 - Ta| < 1:
+ *     T67 = sign(K6) * sign(Ta - K2/10) * |K2/10 - Ta|
+ *   Else:
+ *     T67 = (K6/10) * sign(Ta - K2/10) * (log10(|K2/10 - Ta|) + K7/100)
+ */
+function calculateT67(Ta, K2, K6, K7) {
+  if (K6 === 0) return 0.0;
+  const K2s = K2 / 10.0;
+  const diff = K2s - Ta;
+  if (Math.abs(diff) < 1) {
+    const sK6 = Math.sign(K6);
+    const sd  = Ta !== K2s ? Math.sign(Ta - K2s) : 0;
+    return sK6 * sd * Math.abs(diff);
+  }
+  const sd = Math.sign(Ta - K2s);
+  const logTerm = Math.log10(Math.abs(diff)) + K7 / 100.0;
+  return (K6 / 10.0) * sd * logTerm;
+}
+
+/**
+ * Calculate the temperature correction value Td.
+ *
+ * This is the heart of the correction model. It computes how many degrees
+ * to subtract from the IR sensor reading. The correction has three parts:
+ *
+ *   Linear part:  (K1/100) * (Ta - K2/10)
+ *     --> Grows proportionally with temperature. K1 controls the slope.
+ *         At K1=33 (default), the correction is 0.33°C per degree ambient.
+ *
+ *   Exponential part:  (K3/100) * exp(K4/1000 * Ta)^(K5/100)
+ *     --> Kicks in at higher temperatures where water vapor effects are
+ *         non-linear. When K3=0 (default), this whole term is zero.
+ *
+ *   Cold weather part:  T67
+ *     --> Extra adjustment for cold conditions (see calculateT67 above).
+ *         When K6=0 (default), this is zero.
+ *
+ * The full formula:
+ *   Td = linear + exponential + T67
+ */
+function calculateTd(Ta, kf) {
+  const linear  = (kf.K1 / 100.0) * (Ta - kf.K2 / 10.0);
+  const expTerm = (kf.K3 / 100.0) * Math.pow(Math.exp(kf.K4 / 1000.0 * Ta), kf.K5 / 100.0);
+  const T67     = calculateT67(Ta, kf.K2, kf.K6, kf.K7);
+  return linear + expTerm + T67;
+}
+
+/**
+ * Simulate the IR sensor reading (Ts) for a given ambient temperature
+ * and sky condition.
+ *
+ * The IR sensor looks straight up and measures thermal radiation from the sky.
+ * What it "sees" depends on what's above it:
+ *
+ *   Clear sky:    The sensor sees the cold upper atmosphere (-40 to -60°C).
+ *                 The reading is far below ambient. Humidity matters here because
+ *                 water vapor emits infrared -- more humidity = warmer reading.
+ *
+ *   Thin clouds:  High cirrus clouds are cold but warmer than clear sky.
+ *                 Sensor reads ~15°C below ambient.
+ *
+ *   Cloudy:       Mid-level clouds are closer to ambient temperature.
+ *                 Sensor reads ~8°C below ambient.
+ *
+ *   Overcast:     Low thick clouds are nearly at ambient temperature.
+ *                 Sensor reads only ~3°C below ambient.
+ */
+function getIrTemperature(Ta, skyCondition, humidityFactor) {
+  if (skyCondition === 'clear') {
+    // Clear sky model: sensor sees cold stratosphere.
+    // Higher humidity = more atmospheric IR emission = smaller delta.
+    // At humidityFactor=1.0: base delta is 25°C.
+    // At humidityFactor=0.7 (desert): base delta is 32.5°C (very cold reading).
+    // At humidityFactor=1.3 (humid): base delta is 17.5°C (warmer reading).
+    const baseDelta = 25.0 * (2.0 - humidityFactor);
+    const humEffect = 0.15 * humidityFactor;
+    let delta = baseDelta + humEffect * Ta;
+    // Non-linear effect above 15°C: warm air holds exponentially more
+    // water vapor, which adds significant IR emission
+    if (Ta > 15) delta += 0.08 * humidityFactor * Math.pow(Ta - 15, 1.5);
+    return Ta - delta;
+  }
+  if (skyCondition === 'thin_clouds') return Ta - 15.0 - 0.05 * Ta;
+  if (skyCondition === 'cloudy')      return Ta - 8.0 - 0.03 * Ta;
+  if (skyCondition === 'overcast')    return Ta - 3.0;
+  return Ta - 25.0;  // fallback
+}
+
+/**
+ * Calculate the final corrected sky temperature: Tsky = Ts - Td
+ *
+ * This is the value the CloudWatcher reports and uses for cloud detection.
+ * The thresholds are:
+ *   Tsky < -13°C  -->  CLEAR SKY (safe for imaging)
+ *   -13 to -11°C  -->  CLOUDY (thin clouds, caution)
+ *   Tsky > -11°C  -->  OVERCAST (close observatory)
+ */
+function calculateTsky(Ta, kf, skyCondition, humidityFactor) {
+  return getIrTemperature(Ta, skyCondition, humidityFactor) - calculateTd(Ta, kf);
+}
+
+
+// ============================================================================
+// OBJECTIVE FUNCTION (the "scoring" function)
+// ============================================================================
+// This function answers the question: "How GOOD is a given set of K-factors?"
+// It returns a single number (the "cost"). Lower cost = better K-factors.
+//
+// The cost is calculated by simulating clear-sky readings across 200 temperature
+// points and checking four things:
+//
+//   1. FLATNESS (weight: x10):  How much do the readings vary?
+//      Ideal: all 200 clear-sky readings are exactly the same temperature.
+//      Measured as: variance of all readings * 10.
+//
+//   2. TARGET (weight: x0.5):  Is the average close to -18°C?
+//      We want clear sky to read about -18°C (safely below the -13°C threshold).
+//      Measured as: (average - (-18))^2 * 0.5.
+//
+//   3. THRESHOLD SAFETY (weight: x100 per violation):
+//      No clear-sky reading should ever go above -13°C (that would trigger a
+//      false "cloudy" alert). Each violation adds a harsh penalty of 100.
+//
+//   4. CLOUD SEPARATION (weight: x10):
+//      Cloudy skies should read above -11°C so clouds are actually detected.
+//      If the average cloudy reading is below -11, a penalty is applied.
+//
+// A perfect score would be 0 (perfectly flat, exactly -18°C, no violations,
+// good cloud separation). In practice, scores around 3-5 are excellent.
+function objectiveFunction(params, TaRange, humidityFactor, targetTsky) {
+  if (targetTsky === undefined) targetTsky = -18.0;
+  const kf = { K1: params[0], K2: params[1], K3: params[2], K4: params[3], K5: params[4], K6: params[5], K7: params[6] };
+  try {
+    const n = TaRange.length;
+    const clearTemps  = new Float64Array(n);
+    const cloudyTemps = new Float64Array(n);
+
+    // Simulate sky temperature at every point in the temperature range
+    for (let i = 0; i < n; i++) {
+      clearTemps[i]  = calculateTsky(TaRange[i], kf, 'clear', humidityFactor);
+      cloudyTemps[i] = calculateTsky(TaRange[i], kf, 'cloudy', humidityFactor);
+      if (!isFinite(clearTemps[i]) || !isFinite(cloudyTemps[i])) return 1e10;  // invalid = worst score
+    }
+
+    // Component 1: Variance of clear-sky readings (want: as close to 0 as possible)
+    const v  = variance(clearTemps);
+
+    // Component 2: How far is the average from -18°C target?
+    const mc = mean(clearTemps);
+    const mp = (mc - targetTsky) ** 2;
+
+    // Component 3: Count clear-sky readings that would be falsely classified as "cloudy"
+    let tp = 0;
+    for (let i = 0; i < n; i++) if (clearTemps[i] > -13.0) tp += 100;
+
+    // Component 4: Can we still detect actual clouds?
+    const cm = mean(cloudyTemps);
+    const sp = cm < -11 ? (-11 - cm) ** 2 * 10 : 0;
+
+    // Weighted sum: total cost (lower = better)
+    return v * 10 + mp * 0.5 + tp + sp;
+  } catch (e) { return 1e10; }
+}
+
+
+// ============================================================================
+// SEEDED PSEUDO-RANDOM NUMBER GENERATOR (xoshiro128**)
+// ============================================================================
+// We use a seeded PRNG instead of Math.random() so that the optimization
+// produces reproducible results. Given the same seed (42), the same sequence
+// of random numbers is generated every time, so the same inputs always
+// produce the same optimized K-factors.
+//
+// The xoshiro128** algorithm is fast, has good statistical properties,
+// and is widely used in scientific computing.
+function createRNG(seed) {
+  // Initialize 4-element state from seed using XOR mixing
+  let s = [seed, seed ^ 0xDEADBEEF, seed ^ 0x12345678, seed ^ 0xCAFEBABE];
+  function rotl(x, k) { return ((x << k) | (x >>> (32 - k))) >>> 0; }
+  function next() {
+    const result = (rotl((s[1] * 5) >>> 0, 7) * 9) >>> 0;
+    const t = (s[1] << 9) >>> 0;
+    s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3];
+    s[2] ^= t; s[3] = rotl(s[3], 11);
+    return result;
+  }
+  // Warm up: discard first 20 values to mix the state thoroughly
+  for (let i = 0; i < 20; i++) next();
+  return {
+    random() { return (next() >>> 0) / 4294967296; },           // returns [0, 1)
+    randInt(lo, hi) { return lo + Math.floor(this.random() * (hi - lo)); }  // returns [lo, hi)
+  };
+}
+
+
+// ============================================================================
+// DIFFERENTIAL EVOLUTION OPTIMIZER
+// ============================================================================
+// This is the core optimization algorithm. It finds the best K-factors
+// by evolving a "population" of candidate solutions over many generations.
+//
+// HOW IT WORKS (analogy: breeding the best recipe):
+//
+// Imagine you're trying to find the best recipe with 7 ingredients (K1-K7).
+// You don't know what quantities to use, so:
+//
+//   Step 1 - CREATE INITIAL RECIPES:
+//     Generate 105 random recipes (each with random amounts of each ingredient).
+//     Taste-test each one (= evaluate the objective function).
+//     Population size = 15 * 7 dimensions = 105 candidates.
+//
+//   Step 2 - BREED BETTER RECIPES (repeat for ~255 generations):
+//     For each recipe in the population:
+//       a) Pick 3 other random recipes (A, B, C)
+//       b) Create a trial recipe: start with A, then for each ingredient,
+//          add the DIFFERENCE between B and C (scaled by a mutation factor F).
+//          This is like saying: "take recipe A, and nudge it in the direction
+//          that makes B different from C."
+//       c) Mix (crossover): randomly keep some ingredients from the original
+//          recipe and some from the trial. This creates diversity.
+//       d) Taste-test the new recipe. If it's better, it replaces the old one.
+//
+//   Step 3 - CHECK IF DONE:
+//     The population has "converged" when all 105 recipes taste about the same
+//     (the standard deviation of their scores is tiny). This means the
+//     population has found the optimal region and further evolution won't help.
+//
+//   Step 4 - POLISH:
+//     Fine-tune the best recipe by making tiny adjustments to each ingredient
+//     one at a time (coordinate descent). This squeezes out the last fraction
+//     of improvement.
+//
+// KEY PARAMETERS:
+//   popsize = 15:     105 candidates (15 per dimension)
+//   maxiter = 2000:   Maximum generations (usually converges in ~255)
+//   mutation = [0.5, 1.0]:  Mutation strength varies randomly each generation
+//                           (called "dithering" -- helps avoid getting stuck)
+//   crossover = 0.7:  70% chance each ingredient comes from the trial recipe
+//   tol = 1e-10:      Population converges when score spread < this threshold
+//   seed = 42:        Reproducible random sequence
+//
+// COMPUTATION BUDGET (typical run with default settings):
+//   Initial evaluation:      105 objective function calls
+//   ~255 generations:         255 * 105 = ~26,775 calls
+//   Polish step:              ~150 calls
+//   TOTAL:                    ~27,000 objective function calls
+//   Each call simulates:      400 sky temperatures (200 clear + 200 cloudy)
+//   TOTAL SKY SIMULATIONS:    ~10.8 million
+//   TOTAL ARITHMETIC OPS:     ~200 million floating-point operations
+//
+// This matches the behavior of scipy.optimize.differential_evolution from Python,
+// using the same convergence criterion, deferred updating, and dithering strategy.
+//
+async function differentialEvolution(objFn, bounds, args, options) {
+  const {
+    seed = 42, maxiter = 2000, tol = 1e-10, atol = 0,
+    popsize = 15, mutation = [0.5, 1.0], crossover = 0.7,
+    onProgress = null
+  } = options || {};
+
+  const D = bounds.length;       // Number of dimensions (7 K-factors)
+  const NP = popsize * D;        // Population size: 15 * 7 = 105 candidates
+  const rng = createRNG(seed);
+  const MACHEPS = 2.220446049250313e-16;  // Machine epsilon for float64
+
+  // --- Step 1: Create initial population with random candidates ---
+  // Each individual is an array of 7 values, one per K-factor,
+  // randomly placed within the allowed bounds.
+  const pop = [];
+  const fitness = new Float64Array(NP);
+  for (let i = 0; i < NP; i++) {
+    const ind = new Float64Array(D);
+    for (let j = 0; j < D; j++) {
+      ind[j] = bounds[j][0] + rng.random() * (bounds[j][1] - bounds[j][0]);
+    }
+    pop.push(ind);
+    fitness[i] = objFn(ind, ...args);   // Score this candidate
+  }
+
+  // Find the best candidate so far
+  let bestIdx = 0;
+  for (let i = 1; i < NP; i++) if (fitness[i] < fitness[bestIdx]) bestIdx = i;
+  let bestFit = fitness[bestIdx];
+  let finalGen = 0;
+
+  // Dithering: the mutation factor F is randomly drawn from [0.5, 1.0] each
+  // generation. Higher F = bigger mutations = more exploration but slower
+  // convergence. Varying F prevents the population from getting stuck.
+  const useDither = Array.isArray(mutation);
+  const mutLo = useDither ? mutation[0] : mutation;
+  const mutHi = useDither ? mutation[1] : mutation;
+
+  // --- Step 2: Evolution loop ---
+  for (let gen = 0; gen < maxiter; gen++) {
+    finalGen = gen;
+
+    // Pick a random mutation factor for this generation
+    const F = useDither ? mutLo + rng.random() * (mutHi - mutLo) : mutLo;
+
+    // "Deferred updating" means we create ALL trial candidates from the CURRENT
+    // population before replacing any. This prevents early replacements from
+    // biasing later mutations within the same generation.
+    const trialPop = [];
+    const trialFitness = new Float64Array(NP);
+
+    for (let i = 0; i < NP; i++) {
+      // Pick 3 distinct random individuals (not i) for DE/rand/1/bin mutation
+      let a, b, c;
+      do { a = rng.randInt(0, NP); } while (a === i);
+      do { b = rng.randInt(0, NP); } while (b === i || b === a);
+      do { c = rng.randInt(0, NP); } while (c === i || c === a || c === b);
+
+      // Create trial: mutant = A + F * (B - C), then crossover with current
+      const trial = new Float64Array(D);
+      const jrand = rng.randInt(0, D);  // Ensure at least one dimension comes from mutant
+      for (let j = 0; j < D; j++) {
+        if (rng.random() < crossover || j === jrand) {
+          // This dimension comes from the mutant vector
+          trial[j] = pop[a][j] + F * (pop[b][j] - pop[c][j]);
+          // Clip to allowed bounds
+          if (trial[j] < bounds[j][0]) trial[j] = bounds[j][0];
+          if (trial[j] > bounds[j][1]) trial[j] = bounds[j][1];
+        } else {
+          // This dimension stays from the current individual
+          trial[j] = pop[i][j];
+        }
+      }
+      trialPop.push(trial);
+      trialFitness[i] = objFn(trial, ...args);   // Score the trial
+    }
+
+    // Selection: for each position, keep whichever is better (trial or current)
+    for (let i = 0; i < NP; i++) {
+      if (trialFitness[i] <= fitness[i]) {
+        for (let j = 0; j < D; j++) pop[i][j] = trialPop[i][j];
+        fitness[i] = trialFitness[i];
+      }
+    }
+
+    // Update the overall best
+    for (let i = 0; i < NP; i++) {
+      if (fitness[i] < bestFit) { bestIdx = i; bestFit = fitness[i]; }
+    }
+
+    // --- Step 3: Check convergence ---
+    // The population has converged when all candidates have nearly identical
+    // scores. This is the same criterion used by scipy's differential_evolution:
+    //   std(scores) <= atol + tol * |mean(scores)|
+    // With tol=1e-10 and atol=0, this means the score spread must be
+    // vanishingly small relative to the score magnitude.
+    const fMean = mean(fitness);
+    const fStd  = stddev(fitness);
+    if (fStd <= atol + tol * (Math.abs(fMean) + MACHEPS)) break;
+
+    // Yield to the browser's UI thread periodically so the page stays responsive
+    if (gen % 20 === 0) {
+      if (onProgress) onProgress(gen, maxiter, bestFit);
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+
+  // --- Step 4: Polish the best solution ---
+  // Try small nudges in each direction for each parameter.
+  // This is a simple coordinate-descent that fine-tunes the result
+  // (analogous to scipy's L-BFGS-B polishing step).
+  const best = new Float64Array(pop[bestIdx]);
+  let polished = true;
+  for (let round = 0; round < 50 && polished; round++) {
+    polished = false;
+    for (let j = 0; j < D; j++) {
+      for (const step of [1.0, 0.5, 0.1, 0.01]) {
+        for (const sign of [1, -1]) {
+          const trial = new Float64Array(best);
+          trial[j] += sign * step;
+          if (trial[j] < bounds[j][0] || trial[j] > bounds[j][1]) continue;
+          const f = objFn(trial, ...args);
+          if (f < bestFit) {
+            best[j] = trial[j]; bestFit = f; polished = true;
+          }
+        }
+      }
+    }
+  }
+
+  return { x: best, fun: bestFit, nit: finalGen };
+}
+
+
+// ============================================================================
+// OPTIMIZE WRAPPER
+// ============================================================================
+// High-level function that sets up the optimization bounds and runs the DE.
+// The bounds define the allowed range for each K-factor parameter.
+// After optimization, the raw floating-point results are rounded to integers
+// (the CloudWatcher only accepts integer K-factors).
+async function optimizeKFactors(climate, currentKf, onProgress) {
+  // Create 200 evenly-spaced temperature points across the user's climate range.
+  // These represent the conditions the K-factors must work well for.
+  const TaRange = linspace(climate.temp_min, climate.temp_max, 200);
+
+  // Bounds for each K-factor (same as the Python version)
+  const bounds = [
+    [30, 80],     // K1: linear correction strength
+    [-100, 150],  // K2: temperature offset (x10)
+    [0, 30],      // K3: exponential correction strength
+    [50, 200],    // K4: exponential growth rate (x1000)
+    [80, 150],    // K5: exponential power (x100)
+    [-25, 25],    // K6: cold weather factor magnitude
+    [-30, 30],    // K7: cold weather logarithmic adjustment
+  ];
+
+  const result = await differentialEvolution(
+    objectiveFunction, bounds,
+    [TaRange, climate.humidity_factor],
+    { seed: 42, maxiter: 2000, tol: 1e-10, popsize: 15, onProgress }
+  );
+
+  // Round to integers (CloudWatcher firmware requires whole numbers)
+  const opt = {
+    K1: Math.round(result.x[0]),
+    K2: Math.round(result.x[1]),
+    K3: Math.round(result.x[2]),
+    K4: Math.round(result.x[3]),
+    K5: Math.round(result.x[4]),
+    K6: Math.round(result.x[5]),
+    K7: Math.round(result.x[6]),
+  };
+
+  // Calculate final statistics with the rounded values
+  const clearTemps = new Float64Array(200);
+  for (let i = 0; i < 200; i++) clearTemps[i] = calculateTsky(TaRange[i], opt, 'clear', climate.humidity_factor);
+
+  const stats = {
+    mean: mean(clearTemps),
+    std: stddev(clearTemps),
+    range: arrMax(clearTemps) - arrMin(clearTemps),
+    min: arrMin(clearTemps),
+    max: arrMax(clearTemps),
+  };
+
+  return { kf: opt, stats };
+}
+
+
+// ============================================================================
+// APPLICATION STATE
+// ============================================================================
+// These variables hold the current UI state. They are updated by slider
+// callbacks and read by the plot/optimization functions.
+let climate = { temp_min: -10, temp_max: 30, humidity_factor: 1.0 };
+let currentKf = { ...DEFAULT_KF };   // User's current K-factor settings
+let optimizedKf = null;               // Result from optimizer (null until run)
+let isOptimizing = false;              // Prevents double-clicking OPTIMIZE
+
+
+// ============================================================================
+// DOM REFERENCES
+// ============================================================================
+const $ = id => document.getElementById(id);
+
+// Map of all sliders with their display elements and format functions
+const sliders = {
+  tmin:     { el: $('slTmin'),     val: $('valTmin'),     fmt: v => v },
+  tmax:     { el: $('slTmax'),     val: $('valTmax'),     fmt: v => v },
+  humidity: { el: $('slHumidity'), val: $('valHumidity'), fmt: v => parseFloat(v).toFixed(2) },
+  K1: { el: $('slK1'), val: $('valK1'), fmt: v => v },
+  K2: { el: $('slK2'), val: $('valK2'), fmt: v => v },
+  K3: { el: $('slK3'), val: $('valK3'), fmt: v => v },
+  K4: { el: $('slK4'), val: $('valK4'), fmt: v => v },
+  K5: { el: $('slK5'), val: $('valK5'), fmt: v => v },
+  K6: { el: $('slK6'), val: $('valK6'), fmt: v => v },
+  K7: { el: $('slK7'), val: $('valK7'), fmt: v => v },
+};
+
+
+// ============================================================================
+// VISUALIZATION (4-panel Plotly chart)
+// ============================================================================
+// Redraws all 4 plots whenever sliders change or optimization completes.
+//
+// Plot 1 (top-left):  CLEAR SKY COMPARISON
+//   Shows Tsky across the full temperature range for clear-sky conditions.
+//   A perfectly calibrated system produces a HORIZONTAL LINE here.
+//   Green band = clear, yellow band = ambiguous, red band = overcast zone.
+//
+// Plot 2 (top-right): ALL SKY CONDITIONS
+//   Shows how Tsky varies for clear, thin clouds, cloudy, and overcast.
+//   Good K-factors produce well-separated lines (clear well below -13°C,
+//   overcast above -11°C).
+//
+// Plot 3 (bottom-left): CORRECTION FACTOR Td
+//   Shows how much correction is applied at each temperature.
+//   The correction should grow with temperature to compensate for
+//   increased water vapor IR emission in warm weather.
+//
+// Plot 4 (bottom-right): BAR CHART COMPARISON
+//   Compares the temperature variation (range and std dev) for each
+//   configuration. Lower bars = better (more consistent readings).
+//
+function updatePlots() {
+  const TaRange = Array.from(linspace(climate.temp_min, climate.temp_max, 200));
+  const hf = climate.humidity_factor;
+
+  // Helper: compute 200 clear-sky or correction values for a K-factor set
+  function computeClear(kf) { return TaRange.map(Ta => calculateTsky(Ta, kf, 'clear', hf)); }
+  function computeTd(kf)    { return TaRange.map(Ta => calculateTd(Ta, kf)); }
+
+  const lunaticoClear = computeClear(LUNATICO_KF);
+  const currentClear  = computeClear(currentKf);
+  const lunaticTd     = computeTd(LUNATICO_KF);
+  const currentTd     = computeTd(currentKf);
+
+  const lunaticoStd = stddev(lunaticoClear).toFixed(2);
+  const currentStd  = stddev(currentClear).toFixed(2);
+
+  // ---- Plot 1: Clear Sky Comparison ----
+  // Shows how flat each configuration's clear-sky reading is.
+  // The Lunatico reference is shown as a dashed gray line.
+  const traces1 = [
+    { x: TaRange, y: lunaticoClear, name: `Lunatico Ref (\u03c3=${lunaticoStd}\u00b0C)`, line: { color: '#888888', width: 1.5, dash: 'dash' }, opacity: 0.7, xaxis: 'x', yaxis: 'y' },
+    { x: TaRange, y: currentClear,  name: `Current (\u03c3=${currentStd}\u00b0C)`, line: { color: '#e74c3c', width: 2 }, xaxis: 'x', yaxis: 'y' },
+  ];
+
+  // ---- Plot 2: All Sky Conditions ----
+  // Uses optimized K-factors if available, otherwise current settings.
+  const kfForConditions = optimizedKf || currentKf;
+  const condTitle = optimizedKf ? 'All Sky Conditions (Optimized)' : 'All Sky Conditions (Current)';
+  const traces2 = [
+    { x: TaRange, y: TaRange.map(Ta => calculateTsky(Ta, kfForConditions, 'clear', hf)),       name: 'Clear',       line: { color: 'blue',   width: 2 }, xaxis: 'x2', yaxis: 'y2' },
+    { x: TaRange, y: TaRange.map(Ta => calculateTsky(Ta, kfForConditions, 'thin_clouds', hf)), name: 'Thin Clouds', line: { color: 'cyan',   width: 2 }, xaxis: 'x2', yaxis: 'y2' },
+    { x: TaRange, y: TaRange.map(Ta => calculateTsky(Ta, kfForConditions, 'cloudy', hf)),      name: 'Cloudy',      line: { color: 'orange', width: 2 }, xaxis: 'x2', yaxis: 'y2' },
+    { x: TaRange, y: TaRange.map(Ta => calculateTsky(Ta, kfForConditions, 'overcast', hf)),    name: 'Overcast',    line: { color: 'red',    width: 2 }, xaxis: 'x2', yaxis: 'y2' },
+  ];
+
+  // ---- Plot 3: Correction Factor Td ----
+  const traces3 = [
+    { x: TaRange, y: lunaticTd,  name: 'Lunatico Ref', line: { color: '#888888', width: 1.5, dash: 'dash' }, opacity: 0.7, xaxis: 'x3', yaxis: 'y3' },
+    { x: TaRange, y: currentTd,  name: 'Current',      line: { color: '#e74c3c', width: 2 }, xaxis: 'x3', yaxis: 'y3' },
+    { x: TaRange, y: TaRange,    name: 'Ta (ref)',      line: { color: 'black', width: 1, dash: 'dot' }, opacity: 0.3, xaxis: 'x3', yaxis: 'y3' },
+  ];
+
+  // ---- Plot 4: Bar Chart (Range and Std Dev comparison) ----
+  const barConfigs = [
+    { name: 'Lunatico', data: lunaticoClear, color: '#888888' },
+    { name: 'Current',  data: currentClear,  color: '#e74c3c' },
+  ];
+
+  // Add optimized data to all plots if available
+  if (optimizedKf) {
+    const optClear = computeClear(optimizedKf);
+    const optStd   = stddev(optClear).toFixed(2);
+    const optTd    = computeTd(optimizedKf);
+    traces1.push({ x: TaRange, y: optClear, name: `OPTIMIZED (\u03c3=${optStd}\u00b0C)`, line: { color: '#27ae60', width: 3 }, xaxis: 'x', yaxis: 'y' });
+    traces3.push({ x: TaRange, y: optTd,    name: 'OPTIMIZED', line: { color: '#27ae60', width: 3 }, xaxis: 'x3', yaxis: 'y3' });
+    barConfigs.push({ name: 'OPTIMIZED', data: optClear, color: '#27ae60' });
+  }
+
+  const barNames  = barConfigs.map(c => c.name);
+  const barRanges = barConfigs.map(c => arrMax(c.data) - arrMin(c.data));
+  const barStds   = barConfigs.map(c => stddev(c.data));
+  const barColors = barConfigs.map(c => c.color);
+
+  const traces4 = [
+    {
+      x: barNames, y: barRanges, name: 'Range (\u00b0C)', type: 'bar',
+      marker: { color: barColors, opacity: 0.7 },
+      text: barRanges.map(v => v.toFixed(1)), textposition: 'outside',
+      xaxis: 'x4', yaxis: 'y4', offsetgroup: 1,
+    },
+    {
+      x: barNames, y: barStds, name: 'Std Dev (\u00b0C)', type: 'bar',
+      marker: { color: barColors, pattern: { shape: '/' } },
+      text: barStds.map(v => v.toFixed(1)), textposition: 'outside',
+      xaxis: 'x4', yaxis: 'y4', offsetgroup: 2,
+    },
+  ];
+
+  const allTraces = [...traces1, ...traces2, ...traces3, ...traces4];
+
+  // Threshold lines and colored bands for the clear-sky plot
+  const xRange1  = [climate.temp_min - 1, climate.temp_max + 1];
+  const shapes = [
+    // Plot 1: green (clear), yellow (ambiguous), red (overcast) background bands
+    { type: 'rect', xref: 'x', yref: 'y', x0: xRange1[0], x1: xRange1[1], y0: -50, y1: -13, fillcolor: 'rgba(0,128,0,0.08)', line: { width: 0 } },
+    { type: 'rect', xref: 'x', yref: 'y', x0: xRange1[0], x1: xRange1[1], y0: -13, y1: -11, fillcolor: 'rgba(255,255,0,0.08)', line: { width: 0 } },
+    { type: 'rect', xref: 'x', yref: 'y', x0: xRange1[0], x1: xRange1[1], y0: -11, y1: 10,  fillcolor: 'rgba(255,0,0,0.08)', line: { width: 0 } },
+    // Plot 1: threshold lines at -13°C (clear/cloudy) and -11°C (cloudy/overcast)
+    { type: 'line', xref: 'x', yref: 'y', x0: xRange1[0], x1: xRange1[1], y0: -13, y1: -13, line: { color: 'green', width: 2, dash: 'dash' } },
+    { type: 'line', xref: 'x', yref: 'y', x0: xRange1[0], x1: xRange1[1], y0: -11, y1: -11, line: { color: 'orange', width: 2, dash: 'dash' } },
+    // Plot 2: same threshold lines
+    { type: 'line', xref: 'x2', yref: 'y2', x0: xRange1[0], x1: xRange1[1], y0: -13, y1: -13, line: { color: 'green', width: 2, dash: 'dash' } },
+    { type: 'line', xref: 'x2', yref: 'y2', x0: xRange1[0], x1: xRange1[1], y0: -11, y1: -11, line: { color: 'orange', width: 2, dash: 'dash' } },
+  ];
+
+  // Plotly layout: 2x2 subplot grid with dark astronomy theme
+  const layout = {
+    grid: { rows: 2, columns: 2, pattern: 'independent', xgap: 0.08, ygap: 0.12 },
+    font: { color: '#e0e0e0', size: 11 },
+    paper_bgcolor: '#1a1a2e',
+    plot_bgcolor: '#16213e',
+    margin: { l: 60, r: 20, t: 40, b: 50 },
+    showlegend: false,
+    shapes: shapes,
+    xaxis:  { title: 'Ambient Temperature (\u00b0C)', range: xRange1, gridcolor: '#2a2a4e' },
+    yaxis:  { title: 'Corrected Sky Temp (\u00b0C)',  range: [-30, -5], gridcolor: '#2a2a4e' },
+    xaxis2: { title: 'Ambient Temperature (\u00b0C)', range: xRange1, gridcolor: '#2a2a4e' },
+    yaxis2: { title: 'Corrected Sky Temp (\u00b0C)',  range: [-30, 10], gridcolor: '#2a2a4e' },
+    xaxis3: { title: 'Ambient Temperature (\u00b0C)', gridcolor: '#2a2a4e' },
+    yaxis3: { title: 'Correction Value Td (\u00b0C)', gridcolor: '#2a2a4e' },
+    xaxis4: { gridcolor: '#2a2a4e' },
+    yaxis4: { title: 'Temperature Variation (\u00b0C)', gridcolor: '#2a2a4e' },
+    annotations: [
+      { text: '<b>\u2605 Clear Sky \u2013 Should Be Horizontal! \u2605</b>', xref: 'x domain',  yref: 'y domain',  x: 0.5, y: 1.12, showarrow: false, font: { size: 13, color: '#fff' } },
+      { text: '<b>' + condTitle + '</b>',                                     xref: 'x2 domain', yref: 'y2 domain', x: 0.5, y: 1.12, showarrow: false, font: { size: 13, color: '#fff' } },
+      { text: '<b>Correction Factor</b>',                                     xref: 'x3 domain', yref: 'y3 domain', x: 0.5, y: 1.12, showarrow: false, font: { size: 13, color: '#fff' } },
+      { text: '<b>Comparison: Lower = Better</b>',                            xref: 'x4 domain', yref: 'y4 domain', x: 0.5, y: 1.12, showarrow: false, font: { size: 13, color: '#fff' } },
+    ],
+    legend: { bgcolor: 'rgba(0,0,0,0)', font: { size: 10 } },
+    barmode: 'group',
+  };
+
+  allTraces.forEach(t => { t.showlegend = true; });
+
+  Plotly.react('plotDiv', allTraces, layout, { responsive: true, displayModeBar: false });
+}
+
+
+// ============================================================================
+// EVENT HANDLERS
+// ============================================================================
+
+// Read current slider values into the climate/kf state objects
+function readClimate() {
+  climate.temp_min = parseFloat(sliders.tmin.el.value);
+  climate.temp_max = parseFloat(sliders.tmax.el.value);
+  climate.humidity_factor = parseFloat(sliders.humidity.el.value);
+}
+function readKFactors() {
+  currentKf = {
+    K1: parseFloat(sliders.K1.el.value),
+    K2: parseFloat(sliders.K2.el.value),
+    K3: parseFloat(sliders.K3.el.value),
+    K4: parseFloat(sliders.K4.el.value),
+    K5: parseFloat(sliders.K5.el.value),
+    K6: parseFloat(sliders.K6.el.value),
+    K7: parseFloat(sliders.K7.el.value),
+  };
+}
+
+// Update the numeric display next to each slider
+function syncDisplay() {
+  for (const [key, s] of Object.entries(sliders)) {
+    s.val.textContent = s.fmt(s.el.value);
+  }
+}
+
+// Wire up all sliders: any change triggers immediate plot update
+for (const [key, s] of Object.entries(sliders)) {
+  s.el.addEventListener('input', () => {
+    syncDisplay();
+    readClimate();
+    readKFactors();
+    updatePlots();
+  });
+}
+
+// Climate preset dropdown: sets slider values and clears previous optimization
+$('presetSelect').addEventListener('change', function() {
+  const p = CLIMATE_PRESETS[this.value];
+  if (!p) return;
+  sliders.tmin.el.value = p.temp_min;
+  sliders.tmax.el.value = p.temp_max;
+  sliders.humidity.el.value = p.humidity_factor;
+  syncDisplay();
+  readClimate();
+  optimizedKf = null;
+  $('resultsText').textContent = 'Click OPTIMIZE to calculate...';
+  $('resultsBox').className = 'results-box';
+  updatePlots();
+});
+
+// OPTIMIZE button: runs the differential evolution algorithm asynchronously
+$('btnOptimize').addEventListener('click', async () => {
+  if (isOptimizing) return;
+  isOptimizing = true;
+  const btn = $('btnOptimize');
+  btn.disabled = true;
+  btn.textContent = 'Optimizing...';
+  $('resultsText').textContent = 'Running differential evolution...';
+  $('resultsBox').className = 'results-box';
+
+  try {
+    const { kf, stats } = await optimizeKFactors(climate, currentKf, (gen, maxGen, fit) => {
+      btn.textContent = `Optimizing... ${Math.round(gen / maxGen * 100)}%`;
+    });
+    optimizedKf = kf;
+    $('resultsText').innerHTML =
+      `K1=${kf.K1}  K2=${kf.K2}  K3=${kf.K3}  K4=${kf.K4}  K5=${kf.K5}  K6=${kf.K6}  K7=${kf.K7}\n` +
+      `Range: ${stats.range.toFixed(2)}\u00b0C  |  Std Dev: ${stats.std.toFixed(2)}\u00b0C  \u2713`;
+    $('resultsBox').className = 'results-box success';
+    updatePlots();
+  } catch (e) {
+    $('resultsText').textContent = 'Error: ' + e.message;
+    $('resultsBox').className = 'results-box error';
+  }
+  btn.textContent = 'OPTIMIZE';
+  btn.disabled = false;
+  isOptimizing = false;
+});
+
+// Reset button: restores factory defaults and clears optimization results
+$('btnReset').addEventListener('click', () => {
+  currentKf = { ...DEFAULT_KF };
+  optimizedKf = null;
+  sliders.K1.el.value = 33;
+  sliders.K2.el.value = 0;
+  sliders.K3.el.value = 0;
+  sliders.K4.el.value = 100;
+  sliders.K5.el.value = 100;
+  sliders.K6.el.value = 0;
+  sliders.K7.el.value = 0;
+  syncDisplay();
+  $('resultsText').textContent = 'Click OPTIMIZE to calculate...';
+  $('resultsBox').className = 'results-box';
+  updatePlots();
+});
+
+// Save button: downloads the current plot as a PNG image
+$('btnSave').addEventListener('click', () => {
+  Plotly.downloadImage('plotDiv', { format: 'png', width: 1400, height: 1000, filename: 'cloudwatcher_analysis' });
+});
+
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+// On page load: sync all displays, read initial values, draw the first plots
+syncDisplay();
+readClimate();
+readKFactors();
+updatePlots();
+</script>
+</body>
+</html>

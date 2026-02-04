@@ -7,7 +7,11 @@ An interactive tool for optimizing sky temperature correction parameters for the
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 
 Over the years I was never really satisfied with my cloudwatcher calibration settings. This little optimizer changed that luckily!
-Just by entering 3 numbers (min/max temperature and climate region) it simulates the optimum by finishing around around 6 Million calculations - in a minute or so.
+Just by entering 3 numbers (min/max temperature and climate region) it simulates the optimum by finishing around 10.8 Million sky temperature calculations - in under a second in the browser, or about 20 seconds in Python.
+
+Available in two versions:
+- **Python** (GUI + CLI) -- requires NumPy, SciPy, Matplotlib
+- **Browser** (HTML/JavaScript) -- just open `cloudwatcher_optimizer.html` in any modern browser, no installation needed
 
 <img width="1521" height="1276" alt="Bildschirmfoto 2026-01-28 um 10 30 28" src="https://github.com/user-attachments/assets/c69a7d38-5412-4377-89a8-58a2782f3588" />
 
@@ -19,6 +23,8 @@ Just by entering 3 numbers (min/max temperature and climate region) it simulates
 
 - [The Problem](#the-problem)
 - [The Solution](#the-solution)
+- [How the Optimization Works](#how-the-optimization-works)
+- [How Many Calculations?](#how-many-calculations)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Understanding the Physics](#understanding-the-physics)
@@ -85,16 +91,77 @@ This tool:
 
 ---
 
+## How the Optimization Works
+
+Finding the best K-factors is like tuning 7 knobs on a radio to get the clearest signal. You can't just try every combination (there are billions), so the optimizer uses a clever shortcut called **Differential Evolution** -- a method inspired by natural selection.
+
+### The Idea in Plain Language
+
+1. **Start with random guesses**: The optimizer creates 105 random K-factor combinations (the "population"). Think of them as 105 randomly configured CloudWatchers.
+
+2. **Test each one**: For every guess, it simulates what the CloudWatcher would read on a clear night across 200 different temperatures (from your coldest winter night to your warmest summer night). A good guess produces nearly identical readings at every temperature. A bad guess produces readings that drift wildly.
+
+3. **Breed the best**: Now comes the clever part. For each member of the population, the optimizer picks 3 others at random and creates a new candidate by combining them -- specifically, it takes one and nudges it in the direction that makes the other two different. If this new candidate performs better, it replaces the old one. This is like selectively breeding for the trait "flat clear-sky reading".
+
+4. **Repeat for ~255 generations**: Each generation, all 105 candidates compete and improve. Over time, they all converge toward the same optimal answer, like a swarm narrowing in on the best solution from many directions at once.
+
+5. **Final polish**: Once the population has converged, a fine-tuning step makes tiny adjustments to each parameter one at a time, squeezing out the last bit of improvement.
+
+### What Makes a Good Score?
+
+Each K-factor combination gets a single "score" (lower = better) based on four things:
+
+| Criterion | What it Checks | Why it Matters |
+|-----------|---------------|----------------|
+| **Flatness** | How much do clear-sky readings vary across temperatures? | The whole point -- we want consistent readings year-round |
+| **Target** | Is the average clear-sky reading near -18°C? | Keeps readings safely below the -13°C "cloudy" threshold |
+| **No false alarms** | Do any clear-sky readings go above -13°C? | Above -13°C would falsely trigger a "cloudy" alert |
+| **Cloud detection** | Are cloudy-sky readings still above -11°C? | We still need to detect actual clouds |
+
+A perfect score is 0. In practice, scores around 3-5 are excellent -- meaning the clear-sky reading varies by only about 2°C across the entire temperature range, compared to 12°C+ with default settings.
+
+---
+
+## How Many Calculations?
+
+The optimizer performs a precisely measurable amount of computation:
+
+| Step | Calculations |
+|------|-------------|
+| Initial population (105 candidates) | 105 objective function evaluations |
+| ~255 generations × 105 candidates | ~26,775 evaluations |
+| Final polishing step | ~150 evaluations |
+| **Total evaluations** | **~27,000** |
+
+Each evaluation simulates **400 sky temperatures** (200 clear sky + 200 cloudy sky), and each simulation involves about 15-20 floating-point arithmetic operations (exponentials, logarithms, multiplications).
+
+**Grand total:**
+- **~27,000** candidate K-factor combinations tested
+- **~10.8 million** individual sky temperature simulations
+- **~200 million** floating-point arithmetic operations
+
+| Version | Time | Why |
+|---------|------|-----|
+| **Browser (JavaScript)** | ~0.3 - 1 second | JIT compiler turns the math into native machine code |
+| **Python** | ~20 - 30 seconds | Interpreted language with function call overhead |
+
+Both versions produce identical results (same physics, same algorithm, same convergence criterion). The JavaScript version is faster because modern browser engines (V8, JavaScriptCore) aggressively compile tight numeric loops into optimized CPU instructions, eliminating the per-operation overhead that Python's interpreter incurs.
+
+---
+
 ## Installation
 
-### Requirements
+### Browser Version (Recommended -- No Installation)
 
+Simply open `cloudwatcher_optimizer.html` in any modern browser (Chrome, Firefox, Safari, Edge). Everything runs locally in your browser -- no server, no account, no installation. The only external resource is the Plotly.js charting library loaded from a CDN.
+
+### Python Version
+
+**Requirements:**
 - Python 3.8 or higher
-- NumPy
-- SciPy
-- Matplotlib
+- NumPy, SciPy, Matplotlib
 
-### Setup
+**Setup:**
 
 ```bash
 # Clone the repository
@@ -345,9 +412,9 @@ The tool uses an empirical model based on typical IR sensor behavior. Your actua
 
 This tool is specifically designed for the AAG CloudWatcher's polynomial model. Other sensors may use different correction algorithms.
 
-### Q: Why does optimization take so long?
+### Q: Why does the Python version take longer than the browser version?
 
-The differential evolution algorithm tests thousands of K-factor combinations to find the global optimum. This typically takes 30-60 seconds on modern hardware.
+Both versions run the exact same algorithm (~27,000 evaluations, ~10.8 million sky temperature simulations). The browser version completes in under 1 second because JavaScript JIT compilers turn the tight numeric loops into native machine code. Python's interpreter adds overhead per function call and arithmetic operation. The results are identical.
 
 ### Q: What if my optimized values look very different from defaults?
 
