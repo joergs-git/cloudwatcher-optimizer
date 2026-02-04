@@ -3,6 +3,8 @@
 An interactive tool for optimizing sky temperature correction parameters for the **Lunatico Astronomia AAG CloudWatcher** cloud detection system. This tool helps astronomers achieve consistent clear-sky detection across all seasons without manual threshold adjustments.
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
+![HTML5](https://img.shields.io/badge/HTML5-E34F26.svg?logo=html5&logoColor=white)
+![JavaScript](https://img.shields.io/badge/JavaScript-ES6+-F7DF1E.svg?logo=javascript&logoColor=black)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 
