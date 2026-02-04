@@ -70,6 +70,9 @@
   }
   header h1 { font-size: 1.4em; color: #fff; letter-spacing: 1px; }
   header p { font-size: 0.85em; color: #a0a0c0; margin-top: 2px; }
+  header .copyright { font-size: 0.75em; color: #708090; margin-top: 4px; }
+  header .copyright a { color: #5a9; text-decoration: none; }
+  header .copyright a:hover { text-decoration: underline; }
 
   /* ---- Main app: controls on top, plots fill remaining space ---- */
   .app { display: flex; flex-direction: column; height: calc(100vh - 70px); }
@@ -209,6 +212,7 @@
 <header>
   <h1>AAG CloudWatcher Solo &mdash; K-Factor Optimizer</h1>
   <p>Interactive sky temperature correction parameter optimization for astronomical observation</p>
+  <p class="copyright">Created 2026 by joergsflow at Astrobin: <a href="https://app.astrobin.com/u/joergsflow" target="_blank" rel="noopener">https://app.astrobin.com/u/joergsflow</a></p>
 </header>
 
 <div class="app">
